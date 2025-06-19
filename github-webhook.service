@@ -1,0 +1,12 @@
+[Unit]
+Description=GitHub Webhook Server
+After=network.target
+
+[Service]
+User=tripathimohit051
+WorkingDirectory=/home/tripathimohit051/githubwebhookhandler
+ExecStart=/usr/bin/python3 /home/tripathimohit051/githubwebhookhandler/webhook_server.py
+Restart=always
+EnvironmentFile=/home/tripathimohit051/githubwebhookhandler/webhooksecrets
+[Install]
+WantedBy=multi-user.target

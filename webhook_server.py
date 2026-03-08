@@ -2,6 +2,7 @@ import json
 import hmac
 import hashlib
 import subprocess
+import shlex
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
 import requests
@@ -11,7 +12,7 @@ import logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
-    filename='/home/tripathimohit051/rule-engine/webhook.log'
+    filename=os.environ.get('WEBHOOK_LOG_FILE', '/tmp/webhook.log')
 )
 logger = logging.getLogger('webhook_server')
 
@@ -20,9 +21,22 @@ PORT = 8000
 SECRET = os.environ.get('WEBHOOK_SECRET')  # Set this to a secure random string
 REPO_PATH = '/home/tripathimohit051/rule-engine'
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
-print(SECRET, GITHUB_TOKEN)
 
 class WebhookHandler(BaseHTTPRequestHandler):
+    def _extract_docker_command(self, payload):
+        data = payload.get('data')
+        if isinstance(data, str):
+            command = data
+        elif isinstance(data, dict):
+            command = data.get('docker_command') or data.get('command')
+        else:
+            command = None
+
+        if not command or not isinstance(command, str):
+            raise ValueError("Missing docker command in payload data section")
+
+        return shlex.split(command)
+
     def _verify_signature(self, data):
         if 'X-Hub-Signature-256' not in self.headers:
             logger.warning("No signature found in request")
@@ -104,17 +118,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
     
     def _run_ci(self, pr_number, payload):
         """Run CI for the specified PR"""
+        commit_sha = None
+        temp_repo_path = None
         try:
             # Extract repository information from payload
             repo_name = payload['repository']['name']
             repo_url = payload['repository']['clone_url']
             commit_sha = payload['pull_request']['head']['sha']
+            docker_command = self._extract_docker_command(payload)
             
             # Create temp directory path
             temp_repo_path = f"/tmp/{repo_name}"
             
             # Update to pending status
-            self._update_pr_status(pr_number, 'pending', 'Running Docker Compose tests...', commit_sha)
+            self._update_pr_status(pr_number, 'pending', 'Running CI command from webhook payload...', commit_sha)
             
             # Check if directory exists and remove it
             if os.path.exists(temp_repo_path):
@@ -135,13 +152,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
             # Checkout the PR branch
             logger.info(f"Checking out PR #{pr_number} branch")
             subprocess.run(['git', 'checkout', f'pr-{pr_number}'])
+            subprocess.run(['git', 'reset', '--hard', commit_sha])
             
-            # Run Docker Compose tests
-            logger.info("Starting Docker Compose services")
-            subprocess.run(['docker-compose', '-f', 'docker/docker-compose.yaml', 'up', '--build', '-d'])
+            # Run docker command from webhook payload data section
+            logger.info(f"Running CI command from payload data: {' '.join(docker_command)}")
 
             stdout, stderr = subprocess.Popen(
-                ['docker-compose', '-f', 'docker/docker-compose.yaml', 'up', 'rule-engine-test'],
+                docker_command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             ).communicate()
@@ -151,10 +168,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             if stderr:
                 logger.error(f"Test errors:\n{stderr.decode('utf-8', errors='replace')}")
                         
-            # Cleanup Docker resources
-            logger.info("Cleaning up Docker resources")
-            subprocess.run(['docker-compose', '-f', 'docker/docker-compose.yaml', 'down'])
-            
             # Update final status
             if len(stderr) == 0:
                 self._update_pr_status(pr_number, 'success', 'All tests passed!', commit_sha)
@@ -165,15 +178,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
             
         except Exception as e:
             logger.error(f"Error running CI for PR #{pr_number}: {str(e)}")
-            self._update_pr_status(pr_number, 'error', f'CI failed: {str(e)}', commit_sha)
-            
-            # Try to clean up Docker resources even if there was an error
-            try:
-                if os.path.exists(temp_repo_path):
-                    os.chdir(temp_repo_path)
-                    subprocess.run(['docker-compose', '-f', 'docker/docker-compose.yaml', 'down'])
-            except Exception:
-                pass
+            if commit_sha:
+                self._update_pr_status(pr_number, 'error', f'CI failed: {str(e)}', commit_sha)
 
 def run_server():
     server_address = ('', PORT)

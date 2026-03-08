@@ -25,38 +25,40 @@ CI_COMMAND_TIMEOUT_SECONDS = int(os.environ.get('CI_COMMAND_TIMEOUT_SECONDS', '3
 
 class WebhookHandler(BaseHTTPRequestHandler):
     _SHA_REGEX = re.compile(r'^[a-fA-F0-9]{40}$')
+    
+    def _extract_ci_steps(self, ci_config):
+        if not isinstance(ci_config, dict) or not ci_config:
+            raise ValueError("ci.json must be a non-empty object")
+        
+        steps = []
+        for step_name, commands in ci_config.items():
+            if not isinstance(commands, list) or not commands:
+                raise ValueError(f"ci.json step '{step_name}' must be a non-empty list")
+            parsed_commands = []
+            for command in commands:
+                if not isinstance(command, str) or not command.strip():
+                    raise ValueError(f"ci.json step '{step_name}' contains invalid command")
+                command_parts = shlex.split(command)
+                if not command_parts:
+                    raise ValueError(f"ci.json step '{step_name}' contains invalid command")
+                parsed_commands.append(command_parts)
+            steps.append((step_name, parsed_commands))
+        
+        return steps
 
-    def _extract_docker_command(self, payload):
-        data = payload.get('data')
-        if isinstance(data, str):
-            command = data
-        elif isinstance(data, dict):
-            command = data.get('docker_command') or data.get('command')
-        else:
-            command = None
-
-        if not command or not isinstance(command, str):
-            raise ValueError("Missing docker command in payload data section")
-
-        command_parts = shlex.split(command)
-        if not command_parts:
-            raise ValueError("Missing docker command in payload data section")
-
-        is_docker_compose = (
-            command_parts[0] == 'docker-compose' or
-            (command_parts[0] == 'docker' and len(command_parts) > 1 and command_parts[1] == 'compose')
+    def _get_pr_head_sha(self, owner, repo, pr_number):
+        headers = {'Accept': 'application/vnd.github.v3+json'}
+        if GITHUB_TOKEN:
+            headers['Authorization'] = f'token {GITHUB_TOKEN}'
+        response = requests.get(
+            f'https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}',
+            headers=headers
         )
-        if not is_docker_compose:
-            raise ValueError("Only docker compose commands are allowed in payload data section")
-
-        for i, part in enumerate(command_parts):
-            if part in ('-f', '--file') and i + 1 < len(command_parts):
-                compose_file = command_parts[i + 1]
-                normalized_path = os.path.normpath(compose_file.replace('\\', '/'))
-                if os.path.isabs(normalized_path) or normalized_path.startswith('..'):
-                    raise ValueError("Compose file path must be relative to repository")
-
-        return command_parts
+        response.raise_for_status()
+        sha = response.json().get('head', {}).get('sha')
+        if not isinstance(sha, str) or not self._SHA_REGEX.match(sha):
+            raise ValueError("Unable to resolve valid PR head SHA")
+        return sha
 
     def _verify_signature(self, data):
         if 'X-Hub-Signature-256' not in self.headers:
@@ -90,15 +92,18 @@ class WebhookHandler(BaseHTTPRequestHandler):
         # Log the event type
         logger.info(f"Received GitHub event: {event}")
         
-        # Process only pull request events
-        if event == 'pull_request':
-            pr_action = payload.get('action')
-            pr_number = payload.get('number')
+        # Process only issue comment events with "runci" on pull requests
+        if event == 'issue_comment':
+            action = payload.get('action')
+            comment_body = payload.get('comment', {}).get('body', '').strip().lower()
+            issue = payload.get('issue', {})
+            pr_number = issue.get('number')
+            is_pr_comment = issue.get('pull_request') is not None
             
-            logger.info(f"Pull request #{pr_number}, action: {pr_action}")
+            logger.info(f"Issue comment action={action}, issue={pr_number}, is_pr_comment={is_pr_comment}")
             
-            if pr_action in ['opened', 'synchronize', 'reopened']:
-                logger.info(f"Processing PR #{pr_number}, action: {pr_action}")
+            if action == 'created' and is_pr_comment and comment_body == 'runci':
+                logger.info(f"Running CI for PR #{pr_number} due to runci comment")
                 self._run_ci(pr_number, payload)
         
         # Respond to GitHub
@@ -106,21 +111,18 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'Webhook received')
     
-    def _update_pr_status(self, pr_number, state, description, commit_sha):
+    def _update_pr_status(self, owner, repo, pr_number, state, description, commit_sha):
         """Update the PR status in GitHub"""
         if not GITHUB_TOKEN:
             logger.warning("No GitHub token found, skipping status update")
             return
-            
-        owner = "temp-noob"
-        repo = "rule-engine"
         
         # Create the status
         data = {
             'state': state,  # 'pending', 'success', 'error', or 'failure'
             'description': description,
             'context': 'CI/Docker Tests',  # Change the context to make it more visible
-            'target_url': f"https://github.com/temp-noob/rule-engine/pull/{pr_number}/checks"
+            'target_url': f"https://github.com/{owner}/{repo}/pull/{pr_number}/checks"
         }
         
         logger.info(f"Updating PR #{pr_number} status to {state}: {description}")
@@ -141,20 +143,21 @@ class WebhookHandler(BaseHTTPRequestHandler):
         """Run CI for the specified PR"""
         commit_sha = None
         temp_repo_path = None
+        owner = None
+        repo = None
         try:
             # Extract repository information from payload
             repo_name = payload['repository']['name']
             repo_url = payload['repository']['clone_url']
-            commit_sha = payload['pull_request']['head']['sha']
-            if not self._SHA_REGEX.match(commit_sha):
-                raise ValueError("Invalid PR head SHA")
-            docker_command = self._extract_docker_command(payload)
+            owner = payload['repository']['owner']['login']
+            repo = repo_name
+            commit_sha = self._get_pr_head_sha(owner, repo, pr_number)
             
             # Create temp directory path
-            temp_repo_path = f"/tmp/{repo_name}"
+            temp_repo_path = f"/tmp/{repo_name}-pr-{pr_number}"
             
             # Update to pending status
-            self._update_pr_status(pr_number, 'pending', 'Running CI command from webhook payload...', commit_sha)
+            self._update_pr_status(owner, repo, pr_number, 'pending', 'Running CI steps from ci.json...', commit_sha)
             
             # Check if directory exists and remove it
             if os.path.exists(temp_repo_path):
@@ -175,41 +178,53 @@ class WebhookHandler(BaseHTTPRequestHandler):
             subprocess.run(['git', 'cat-file', '-e', f'{commit_sha}^{{commit}}'], check=True, cwd=temp_repo_path)
             subprocess.run(['git', 'reset', '--hard', commit_sha], check=True, cwd=temp_repo_path)
             
-            # Run docker command from webhook payload data section
-            logger.info(f"Running CI command from payload data: {' '.join(docker_command)}")
+            # Load and execute ci.json steps: steps sequentially, commands in each step in parallel
+            ci_config_path = os.path.join(temp_repo_path, 'ci.json')
+            with open(ci_config_path, 'r', encoding='utf-8') as ci_file:
+                ci_steps = self._extract_ci_steps(json.load(ci_file))
 
-            process = subprocess.Popen(
-                docker_command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=temp_repo_path
-            )
-            try:
-                stdout, stderr = process.communicate(timeout=CI_COMMAND_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate()
-                raise TimeoutError(
-                    f"CI command '{' '.join(docker_command)}' timed out after {CI_COMMAND_TIMEOUT_SECONDS} seconds"
-                )
-            
-            # Log test output
-            logger.info(f"Test output:\n{stdout.decode('utf-8', errors='replace')}")
-            if stderr:
-                logger.error(f"Test errors:\n{stderr.decode('utf-8', errors='replace')}")
-                        
-            # Update final status
-            if process.returncode == 0:
-                self._update_pr_status(pr_number, 'success', 'All tests passed!', commit_sha)
+            has_failures = False
+            for step_name, commands in ci_steps:
+                logger.info(f"Running CI step '{step_name}' with {len(commands)} command(s) in parallel")
+                processes = []
+                for command_parts in commands:
+                    logger.info(f"Starting command: {' '.join(command_parts)}")
+                    processes.append((
+                        command_parts,
+                        subprocess.Popen(
+                            command_parts,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            cwd=temp_repo_path
+                        )
+                    ))
+
+                for command_parts, process in processes:
+                    try:
+                        stdout, stderr = process.communicate(timeout=CI_COMMAND_TIMEOUT_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
+                        raise TimeoutError(
+                            f"CI command '{' '.join(command_parts)}' timed out after {CI_COMMAND_TIMEOUT_SECONDS} seconds"
+                        )
+                    logger.info(f"Output for {' '.join(command_parts)}:\n{stdout.decode('utf-8', errors='replace')}")
+                    if stderr:
+                        logger.error(f"Errors for {' '.join(command_parts)}:\n{stderr.decode('utf-8', errors='replace')}")
+                    if process.returncode != 0:
+                        has_failures = True
+
+            if has_failures:
+                self._update_pr_status(owner, repo, pr_number, 'failure', 'One or more ci.json commands failed', commit_sha)
             else:
-                self._update_pr_status(pr_number, 'failure', 'Tests failed', commit_sha)
+                self._update_pr_status(owner, repo, pr_number, 'success', 'All ci.json steps passed', commit_sha)
             
-            logger.info(f"CI for PR #{pr_number} completed with status: {'success' if process.returncode == 0 else 'failure'}")
+            logger.info(f"CI for PR #{pr_number} completed with status: {'failure' if has_failures else 'success'}")
             
         except Exception as e:
             logger.error(f"Error running CI for PR #{pr_number}: {str(e)}")
             if commit_sha:
-                self._update_pr_status(pr_number, 'error', f'CI failed: {str(e)}', commit_sha)
+                self._update_pr_status(owner, repo, pr_number, 'error', f'CI failed: {str(e)}', commit_sha)
         finally:
             if temp_repo_path and os.path.exists(temp_repo_path):
                 try:

@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import subprocess
 import shlex
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
 import requests
@@ -19,10 +20,12 @@ logger = logging.getLogger('webhook_server')
 # Configuration
 PORT = 8000
 SECRET = os.environ.get('WEBHOOK_SECRET')  # Set this to a secure random string
-REPO_PATH = '/home/tripathimohit051/rule-engine'
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+CI_COMMAND_TIMEOUT_SECONDS = int(os.environ.get('CI_COMMAND_TIMEOUT_SECONDS', '3600'))
 
 class WebhookHandler(BaseHTTPRequestHandler):
+    _SHA_REGEX = re.compile(r'^[a-fA-F0-9]{40}$')
+
     def _extract_docker_command(self, payload):
         data = payload.get('data')
         if isinstance(data, str):
@@ -35,7 +38,25 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if not command or not isinstance(command, str):
             raise ValueError("Missing docker command in payload data section")
 
-        return shlex.split(command)
+        command_parts = shlex.split(command)
+        if not command_parts:
+            raise ValueError("Missing docker command in payload data section")
+
+        is_docker_compose = (
+            command_parts[0] == 'docker-compose' or
+            (command_parts[0] == 'docker' and len(command_parts) > 1 and command_parts[1] == 'compose')
+        )
+        if not is_docker_compose:
+            raise ValueError("Only docker compose commands are allowed in payload data section")
+
+        for i, part in enumerate(command_parts):
+            if part in ('-f', '--file') and i + 1 < len(command_parts):
+                compose_file = command_parts[i + 1]
+                normalized_path = os.path.normpath(compose_file.replace('\\', '/'))
+                if os.path.isabs(normalized_path) or normalized_path.startswith('..'):
+                    raise ValueError("Compose file path must be relative to repository")
+
+        return command_parts
 
     def _verify_signature(self, data):
         if 'X-Hub-Signature-256' not in self.headers:
@@ -125,6 +146,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
             repo_name = payload['repository']['name']
             repo_url = payload['repository']['clone_url']
             commit_sha = payload['pull_request']['head']['sha']
+            if not self._SHA_REGEX.match(commit_sha):
+                raise ValueError("Invalid PR head SHA")
             docker_command = self._extract_docker_command(payload)
             
             # Create temp directory path
@@ -136,32 +159,39 @@ class WebhookHandler(BaseHTTPRequestHandler):
             # Check if directory exists and remove it
             if os.path.exists(temp_repo_path):
                 logger.info(f"Removing existing directory: {temp_repo_path}")
-                subprocess.run(['rm', '-rf', temp_repo_path])
+                subprocess.run(['rm', '-rf', temp_repo_path], check=True)
             
             # Clone the repository
             logger.info(f"Cloning repository to {temp_repo_path}")
-            subprocess.run(['git', 'clone', repo_url, temp_repo_path])
-            
-            # Change to the repository directory
-            os.chdir(temp_repo_path)
+            subprocess.run(['git', 'clone', repo_url, temp_repo_path], check=True)
             
             # Fetch the PR
             logger.info(f"Fetching PR #{pr_number}")
-            subprocess.run(['git', 'fetch', 'origin', f'pull/{pr_number}/head:pr-{pr_number}'])
+            subprocess.run(['git', 'fetch', 'origin', f'pull/{pr_number}/head:pr-{pr_number}'], check=True, cwd=temp_repo_path)
             
             # Checkout the PR branch
             logger.info(f"Checking out PR #{pr_number} branch")
-            subprocess.run(['git', 'checkout', f'pr-{pr_number}'])
-            subprocess.run(['git', 'reset', '--hard', commit_sha])
+            subprocess.run(['git', 'checkout', f'pr-{pr_number}'], check=True, cwd=temp_repo_path)
+            subprocess.run(['git', 'cat-file', '-e', f'{commit_sha}^{{commit}}'], check=True, cwd=temp_repo_path)
+            subprocess.run(['git', 'reset', '--hard', commit_sha], check=True, cwd=temp_repo_path)
             
             # Run docker command from webhook payload data section
             logger.info(f"Running CI command from payload data: {' '.join(docker_command)}")
 
-            stdout, stderr = subprocess.Popen(
+            process = subprocess.Popen(
                 docker_command,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            ).communicate()
+                stderr=subprocess.PIPE,
+                cwd=temp_repo_path
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=CI_COMMAND_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                raise TimeoutError(
+                    f"CI command '{' '.join(docker_command)}' timed out after {CI_COMMAND_TIMEOUT_SECONDS} seconds"
+                )
             
             # Log test output
             logger.info(f"Test output:\n{stdout.decode('utf-8', errors='replace')}")
@@ -169,17 +199,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 logger.error(f"Test errors:\n{stderr.decode('utf-8', errors='replace')}")
                         
             # Update final status
-            if len(stderr) == 0:
+            if process.returncode == 0:
                 self._update_pr_status(pr_number, 'success', 'All tests passed!', commit_sha)
             else:
                 self._update_pr_status(pr_number, 'failure', 'Tests failed', commit_sha)
             
-            logger.info(f"CI for PR #{pr_number} completed with status: {'success' if len(stderr) == 0 else 'failure'}")
+            logger.info(f"CI for PR #{pr_number} completed with status: {'success' if process.returncode == 0 else 'failure'}")
             
         except Exception as e:
             logger.error(f"Error running CI for PR #{pr_number}: {str(e)}")
             if commit_sha:
                 self._update_pr_status(pr_number, 'error', f'CI failed: {str(e)}', commit_sha)
+        finally:
+            if temp_repo_path and os.path.exists(temp_repo_path):
+                try:
+                    subprocess.run(['rm', '-rf', temp_repo_path], check=True)
+                except Exception as cleanup_error:
+                    logger.error(f"Failed to clean temp path {temp_repo_path}: {cleanup_error}")
 
 def run_server():
     server_address = ('', PORT)

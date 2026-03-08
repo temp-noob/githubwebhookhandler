@@ -7,7 +7,7 @@ To run CI from webhook payload, include the command in `data`, for example:
 ```json
 {
   "data": {
-    "command": "docker-compose -f docker/docker-compose.yaml up position-server-test"
+    "command": "docker-compose -f docker/docker-compose.yaml up rule-engine-test"
   }
 }
 ```

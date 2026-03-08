@@ -4,6 +4,7 @@ import hashlib
 import subprocess
 import shlex
 import re
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
 import requests
@@ -154,7 +155,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
             commit_sha = self._get_pr_head_sha(owner, repo, pr_number)
             
             # Create temp directory path
-            temp_repo_path = f"/tmp/{repo_name}-pr-{pr_number}"
+            safe_repo_name = re.sub(r'[^A-Za-z0-9_.-]', '-', repo_name)
+            temp_repo_path = f"/tmp/{safe_repo_name}-pr-{pr_number}-{uuid.uuid4().hex}"
             
             # Update to pending status
             self._update_pr_status(owner, repo, pr_number, 'pending', 'Running CI steps from ci.json...', commit_sha)
@@ -180,8 +182,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
             
             # Load and execute ci.json steps: steps sequentially, commands in each step in parallel
             ci_config_path = os.path.join(temp_repo_path, 'ci.json')
-            with open(ci_config_path, 'r', encoding='utf-8') as ci_file:
-                ci_steps = self._extract_ci_steps(json.load(ci_file))
+            try:
+                with open(ci_config_path, 'r', encoding='utf-8') as ci_file:
+                    ci_steps = self._extract_ci_steps(json.load(ci_file))
+            except FileNotFoundError as exc:
+                raise FileNotFoundError("ci.json not found in repository root") from exc
 
             has_failures = False
             for step_name, commands in ci_steps:
@@ -213,6 +218,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         logger.error(f"Errors for {' '.join(command_parts)}:\n{stderr.decode('utf-8', errors='replace')}")
                     if process.returncode != 0:
                         has_failures = True
+                        for _, other_process in processes:
+                            if other_process is process:
+                                continue
+                            if other_process.poll() is None:
+                                other_process.kill()
+                            other_process.communicate()
+                        break
+                if has_failures:
+                    break
 
             if has_failures:
                 self._update_pr_status(owner, repo, pr_number, 'failure', 'One or more ci.json commands failed', commit_sha)
@@ -223,7 +237,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             
         except Exception as e:
             logger.error(f"Error running CI for PR #{pr_number}: {str(e)}")
-            if commit_sha:
+            if commit_sha and owner and repo:
                 self._update_pr_status(owner, repo, pr_number, 'error', f'CI failed: {str(e)}', commit_sha)
         finally:
             if temp_repo_path and os.path.exists(temp_repo_path):

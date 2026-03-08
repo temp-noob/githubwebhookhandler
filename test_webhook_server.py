@@ -29,14 +29,16 @@ class WebhookHandlerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.handler._extract_ci_steps({"test": []})
 
+    # First exists() is before clone (no temp dir), second exists() is finally cleanup.
     @patch("webhook_server.os.path.exists", side_effect=[False, True])
     @patch("webhook_server.subprocess.Popen")
     @patch("webhook_server.subprocess.run")
-    @patch("webhook_server.json.load", return_value={"test": ["cmd1", "cmd2"], "lint": ["cmd3"]})
     @patch("webhook_server.open", new_callable=mock_open, read_data='{"test":["cmd1","cmd2"],"lint":["cmd3"]}')
+    @patch("webhook_server.uuid.uuid4")
     def test_run_ci_executes_ci_json_steps_with_parallel_commands(
-        self, _mock_file, _mock_json_load, mock_run, mock_popen, _mock_exists
+        self, mock_uuid, _mock_file, mock_run, mock_popen, _mock_exists
     ):
+        mock_uuid.return_value.hex = "fixedid"
         process_1 = MagicMock()
         process_1.communicate.return_value = (b"ok-1", b"")
         process_1.returncode = 0
@@ -59,29 +61,29 @@ class WebhookHandlerTests(unittest.TestCase):
         self.handler._run_ci(12, payload)
 
         mock_run.assert_any_call(
-            ["git", "clone", "https://github.com/temp-noob/rule-engine.git", "/tmp/rule-engine-pr-12"], check=True
+            ["git", "clone", "https://github.com/temp-noob/rule-engine.git", "/tmp/rule-engine-pr-12-fixedid"], check=True
         )
-        mock_run.assert_any_call(["git", "fetch", "origin", "pull/12/head:pr-12"], check=True, cwd="/tmp/rule-engine-pr-12")
-        mock_run.assert_any_call(["git", "checkout", "pr-12"], check=True, cwd="/tmp/rule-engine-pr-12")
-        mock_run.assert_any_call(["git", "cat-file", "-e", ("a" * 40) + "^{commit}"], check=True, cwd="/tmp/rule-engine-pr-12")
-        mock_run.assert_any_call(["git", "reset", "--hard", "a" * 40], check=True, cwd="/tmp/rule-engine-pr-12")
+        mock_run.assert_any_call(["git", "fetch", "origin", "pull/12/head:pr-12"], check=True, cwd="/tmp/rule-engine-pr-12-fixedid")
+        mock_run.assert_any_call(["git", "checkout", "pr-12"], check=True, cwd="/tmp/rule-engine-pr-12-fixedid")
+        mock_run.assert_any_call(["git", "cat-file", "-e", ("a" * 40) + "^{commit}"], check=True, cwd="/tmp/rule-engine-pr-12-fixedid")
+        mock_run.assert_any_call(["git", "reset", "--hard", "a" * 40], check=True, cwd="/tmp/rule-engine-pr-12-fixedid")
         mock_popen.assert_any_call(
             ["cmd1"],
             stdout=unittest.mock.ANY,
             stderr=unittest.mock.ANY,
-            cwd="/tmp/rule-engine-pr-12",
+            cwd="/tmp/rule-engine-pr-12-fixedid",
         )
         mock_popen.assert_any_call(
             ["cmd2"],
             stdout=unittest.mock.ANY,
             stderr=unittest.mock.ANY,
-            cwd="/tmp/rule-engine-pr-12",
+            cwd="/tmp/rule-engine-pr-12-fixedid",
         )
         mock_popen.assert_any_call(
             ["cmd3"],
             stdout=unittest.mock.ANY,
             stderr=unittest.mock.ANY,
-            cwd="/tmp/rule-engine-pr-12",
+            cwd="/tmp/rule-engine-pr-12-fixedid",
         )
         self.handler._update_pr_status.assert_any_call(
             "temp-noob", "rule-engine", 12, "pending", "Running CI steps from ci.json...", "a" * 40

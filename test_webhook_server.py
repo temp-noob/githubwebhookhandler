@@ -20,8 +20,8 @@ class WebhookHandlerTests(unittest.TestCase):
         self.assertEqual(
             steps,
             [
-                ("test", [["docker-compose", "-f", "docker/docker-compose.yaml", "up", "rule-engine-test"]]),
-                ("lint", [["docker-compose", "-f", "docker/docker-compose.yaml", "up", "lint"]]),
+                ("test", ["docker-compose -f docker/docker-compose.yaml up rule-engine-test"]),
+                ("lint", ["docker-compose -f docker/docker-compose.yaml up lint"]),
             ],
         )
 
@@ -68,19 +68,19 @@ class WebhookHandlerTests(unittest.TestCase):
         mock_run.assert_any_call(["git", "cat-file", "-e", ("a" * 40) + "^{commit}"], check=True, cwd="/tmp/rule-engine-pr-12-fixedid")
         mock_run.assert_any_call(["git", "reset", "--hard", "a" * 40], check=True, cwd="/tmp/rule-engine-pr-12-fixedid")
         mock_popen.assert_any_call(
-            ["cmd1"],
+            ["/bin/bash", "-lc", "cmd1"],
             stdout=unittest.mock.ANY,
             stderr=unittest.mock.ANY,
             cwd="/tmp/rule-engine-pr-12-fixedid",
         )
         mock_popen.assert_any_call(
-            ["cmd2"],
+            ["/bin/bash", "-lc", "cmd2"],
             stdout=unittest.mock.ANY,
             stderr=unittest.mock.ANY,
             cwd="/tmp/rule-engine-pr-12-fixedid",
         )
         mock_popen.assert_any_call(
-            ["cmd3"],
+            ["/bin/bash", "-lc", "cmd3"],
             stdout=unittest.mock.ANY,
             stderr=unittest.mock.ANY,
             cwd="/tmp/rule-engine-pr-12-fixedid",

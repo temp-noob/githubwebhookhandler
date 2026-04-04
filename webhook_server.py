@@ -8,12 +8,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
 import requests
 import logging
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
     level=os.getenv('WEBHOOK_LOG_LEVEL', 'INFO').upper(),
     format='%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
-    filename=os.environ.get('WEBHOOK_LOG_FILE', '/tmp/webhook.log')
+    filename=os.environ.get('WEBHOOK_LOG_FILE', f'/tmp/webhook.log.{datetime.now().strftime("%Y%m%d%H%M%S")}')
 )
 logger = logging.getLogger('webhook_server')
 
@@ -222,6 +223,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                                 other_process.kill()
                             other_process.communicate()
                         break
+                    else:
+                        logger.info(f"Command '{command}' completed successfully")
                 if has_failures:
                     break
 
